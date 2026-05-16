@@ -1,0 +1,12 @@
+[Unit]
+Description=MediaMTX — медиа-сервер для RTSP/RTMP/HLS/WebRTC
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/obs-stream-bot/mediamtx
+ExecStart=/opt/obs-stream-bot/mediamtx/mediamtx /opt/obs-stream-bot/mediamtx.yml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

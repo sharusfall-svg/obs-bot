@@ -1,0 +1,13 @@
+[Unit]
+Description=OBS Telegram Bot
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/opt/obs-stream-bot
+ExecStart=/opt/obs-stream-bot/venv/bin/python obs_bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
