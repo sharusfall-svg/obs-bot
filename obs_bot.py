@@ -5,6 +5,8 @@ import base64
 import hashlib
 import logging
 import sys
+import time
+import httpx  # ставится вместе с python-telegram-bot, отдельная установка не нужна
 from io import BytesIO
 from datetime import datetime
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
@@ -65,6 +67,30 @@ SCENE_BREAK = ""  # REPLACE_ME, например: "BRB" или "Перерыв"
 
 OBS_TIMEOUT          = 10
 HEALTHCHECK_INTERVAL = 30
+
+# ── Авто-переключение сцен по битрейту входящего SRT-потока (MediaMTX) ──
+# Поллер раз в секунду читает Control API MediaMTX (apiAddress в mediamtx.yml,
+# по умолчанию :9883) и считает битрейт пути MEDIAMTX_STREAM_PATH.
+# Watcher: потока нет → SCENE_BREAK сразу; битрейт < LOW дольше DEBOUNCE → SCENE_BREAK;
+# битрейт >= HIGH дольше DEBOUNCE → SCENE_MAIN. Зона между LOW и HIGH — гистерезис,
+# сцена не трогается. Вкл/выкл кнопкой «🔄 Авто-сцена» (по умолчанию включено,
+# после перезапуска бота снова включено).
+MEDIAMTX_API         = "http://localhost:9883/v3"
+MEDIAMTX_STREAM_PATH = "live/stream"   # путь публикации в MediaMTX (streamid=publish:live/stream)
+
+MOBLIN_POLL_INTERVAL    = 1    # секунд между опросами MediaMTX
+STREAM_WATCHER_INTERVAL = 1    # секунд между проверками авто-сцены
+BITRATE_LOW_THRESHOLD   = 250  # kbps — ниже этого → SCENE_BREAK
+BITRATE_HIGH_THRESHOLD  = 300  # kbps — выше этого → SCENE_MAIN
+BITRATE_DEBOUNCE        = 1.0  # секунд удержания перед переключением
+
+_moblin_kbps_cached: int   = 0
+_moblin_prev_bytes: int    = 0
+_moblin_prev_time:  float  = 0.0
+_stream_ready_cached: bool = False   # путь ready в MediaMTX — пишет poller, читает watcher
+_bitrate_low_since:  float | None = None   # monotonic — когда битрейт упал ниже LOW
+_bitrate_high_since: float | None = None   # monotonic — когда битрейт поднялся выше HIGH
+_auto_scene_enabled: bool  = True
 
 # ═══════════════════════════════════════════════════════════
 # OBS WebSocket
@@ -161,6 +187,113 @@ async def healthcheck_loop() -> None:
         except Exception as e: log.exception("Healthcheck ошибка: %s", e)
 
 # ═══════════════════════════════════════════════════════════
+# Авто-переключение сцен по битрейту
+# ═══════════════════════════════════════════════════════════
+
+async def get_moblin_kbps() -> int:
+    # За один опрос /paths/list считаем и битрейт, и готовность пути — флаг кладём в
+    # _stream_ready_cached, чтобы watcher не делал второй HTTP-запрос в секунду.
+    global _moblin_prev_bytes, _moblin_prev_time, _stream_ready_cached
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            r = await client.get(f"{MEDIAMTX_API}/paths/list")
+        if r.status_code != 200:
+            _stream_ready_cached = False
+            return 0
+        data = r.json()
+        ready_items = [
+            item for item in data.get("items", [])
+            if item.get("name") == MEDIAMTX_STREAM_PATH and item.get("ready", False)
+        ]
+        _stream_ready_cached = bool(ready_items)
+        total_bytes = sum(item.get("bytesReceived", item.get("inboundBytes", 0)) for item in ready_items)
+    except Exception:
+        _stream_ready_cached = False
+        return 0
+
+    now = time.monotonic()
+    kbps = 0
+    if _moblin_prev_time > 0:
+        db = total_bytes - _moblin_prev_bytes
+        dt = now - _moblin_prev_time
+        if dt > 0 and db >= 0:
+            kbps = round(db * 8 / dt / 1000)
+    _moblin_prev_bytes = total_bytes
+    _moblin_prev_time  = now
+    return kbps
+
+
+async def moblin_poller_loop() -> None:
+    global _moblin_kbps_cached
+    log.info("MediaMTX poller запущен (путь=%s, интервал=%ds)", MEDIAMTX_STREAM_PATH, MOBLIN_POLL_INTERVAL)
+    try:
+        while True:
+            try:
+                _moblin_kbps_cached = await get_moblin_kbps()
+            except Exception:
+                pass
+            await asyncio.sleep(MOBLIN_POLL_INTERVAL)
+    except asyncio.CancelledError:
+        log.info("MediaMTX poller остановлен")
+
+
+async def stream_watcher_loop() -> None:
+    global _bitrate_low_since, _bitrate_high_since
+    log.info("Stream watcher запущен (интервал=%ds, пороги=%d/%d kbps)",
+             STREAM_WATCHER_INTERVAL, BITRATE_LOW_THRESHOLD, BITRATE_HIGH_THRESHOLD)
+    try:
+        while True:
+            await asyncio.sleep(STREAM_WATCHER_INTERVAL)
+            try:
+                if not _auto_scene_enabled or not SCENE_MAIN or not SCENE_BREAK:
+                    _bitrate_low_since  = None
+                    _bitrate_high_since = None
+                    continue
+
+                ready = _stream_ready_cached
+                scene = await get_current_scene()
+                if scene is None:
+                    continue
+
+                # Поток пропал — сразу SCENE_BREAK, сбрасываем таймеры
+                if not ready:
+                    _bitrate_low_since  = None
+                    _bitrate_high_since = None
+                    if scene != SCENE_BREAK:
+                        log.info("Stream watcher: потока нет → %s", SCENE_BREAK)
+                        await set_scene(SCENE_BREAK)
+                    continue
+
+                # Поток есть — проверяем битрейт
+                kbps = _moblin_kbps_cached
+                now  = time.monotonic()
+
+                if kbps > 0 and kbps < BITRATE_LOW_THRESHOLD:
+                    _bitrate_high_since = None
+                    if _bitrate_low_since is None:
+                        _bitrate_low_since = now
+                    elif now - _bitrate_low_since >= BITRATE_DEBOUNCE and scene != SCENE_BREAK:
+                        log.info("Stream watcher: битрейт %d kbps < %d дольше %.0fs → %s",
+                                 kbps, BITRATE_LOW_THRESHOLD, BITRATE_DEBOUNCE, SCENE_BREAK)
+                        await set_scene(SCENE_BREAK)
+                elif kbps >= BITRATE_HIGH_THRESHOLD:
+                    _bitrate_low_since = None
+                    if _bitrate_high_since is None:
+                        _bitrate_high_since = now
+                    elif now - _bitrate_high_since >= BITRATE_DEBOUNCE and scene == SCENE_BREAK:
+                        log.info("Stream watcher: битрейт %d kbps >= %d дольше %.0fs → %s",
+                                 kbps, BITRATE_HIGH_THRESHOLD, BITRATE_DEBOUNCE, SCENE_MAIN)
+                        await set_scene(SCENE_MAIN)
+                else:
+                    # Битрейт в мёртвой зоне LOW–HIGH или ещё не замерен — не трогаем таймеры
+                    pass
+
+            except Exception:
+                log.exception("stream_watcher iteration error")
+    except asyncio.CancelledError:
+        log.info("Stream watcher остановлен")
+
+# ═══════════════════════════════════════════════════════════
 # Telegram handlers
 # ═══════════════════════════════════════════════════════════
 
@@ -173,8 +306,9 @@ EM_SCENE_MAIN  = "🌅 Основная сцена"
 EM_SCENE_BREAK = "💤 Сцена перерыв"
 EM_SCREENSHOT  = "📷 Скриншот"
 EM_STATUS      = "📊 Статус"
+EM_AUTO_SCENE  = "🔄 Авто-сцена"
 
-ALL_BUTTONS = {EM_START, EM_STOP, EM_SCENE_MAIN, EM_SCENE_BREAK, EM_SCREENSHOT, EM_STATUS}
+ALL_BUTTONS = {EM_START, EM_STOP, EM_SCENE_MAIN, EM_SCENE_BREAK, EM_SCREENSHOT, EM_STATUS, EM_AUTO_SCENE}
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -182,6 +316,7 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(EM_START),       KeyboardButton(EM_STOP)],
             [KeyboardButton(EM_SCENE_MAIN),  KeyboardButton(EM_SCENE_BREAK)],
             [KeyboardButton(EM_SCREENSHOT),  KeyboardButton(EM_STATUS)],
+            [KeyboardButton(EM_AUTO_SCENE)],
         ],
         resize_keyboard=True,
         input_field_placeholder="Управление OBS",
@@ -212,11 +347,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🌅 Основная сцена — переключить на основную сцену\n"
         "💤 Сцена перерыв — переключить на сцену-заглушку\n"
         "📷 Скриншот — снимок текущей основной сцены\n"
-        "📊 Статус — состояние OBS и стрима",
+        "📊 Статус — состояние OBS и стрима\n"
+        "🔄 Авто-сцена — вкл/выкл автопереключение сцен по битрейту",
         parse_mode="Markdown", reply_markup=get_main_keyboard(),
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _auto_scene_enabled
     uid  = update.effective_user.id
     text = update.message.text or ""
     if uid == BLOCKED_USER_ID:
@@ -269,6 +406,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 parse_mode="Markdown", reply_markup=kb,
             )
 
+    elif text == EM_AUTO_SCENE:
+        if not SCENE_MAIN or not SCENE_BREAK:
+            await update.message.reply_text("⚠️ SCENE_MAIN / SCENE_BREAK не заданы в настройках.", reply_markup=kb); return
+        _auto_scene_enabled = not _auto_scene_enabled
+        log.info("Auto scene → %s (uid=%s)", _auto_scene_enabled, uid)
+        state = "включена ✅" if _auto_scene_enabled else "выключена ⏸"
+        await update.message.reply_text(f"🔄 Авто-сцена {state}", reply_markup=kb)
+
     elif text == EM_STATUS:
         is_online, obs_version, err = await get_obs_version()
         if not is_online:
@@ -278,11 +423,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         scene = await get_current_scene()
         stream_str = "🔴 Идёт" if is_live else "⚫ Не идёт"
         if stream_err: stream_str = f"❓ {stream_err}"
+        srt_str  = f"{_moblin_kbps_cached} kbps" if _stream_ready_cached else "нет потока"
+        auto_str = "✅ вкл" if _auto_scene_enabled else "⏸ выкл"
         msg = (
             f"📊 *Статус OBS*\n"
             f"OBS: ✅ v{obs_version}\n"
             f"Стрим: {stream_str}\n"
             f"Сцена: `{scene or '—'}`\n"
+            f"Входящий SRT: {srt_str}\n"
+            f"Авто-сцена: {auto_str}\n"
             f"Время: {datetime.now().strftime('%H:%M:%S')}"
         )
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
@@ -314,19 +463,20 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, blocked_user_handler))
     app.add_error_handler(error_handler)
 
-    _hc_task: asyncio.Task | None = None
+    _bg_tasks: list[asyncio.Task] = []
 
     async def post_init(application: Application) -> None:
-        nonlocal _hc_task
-        _hc_task = asyncio.create_task(healthcheck_loop(), name="obs_healthcheck")
-        log.info("✅ Healthcheck запущен")
+        _bg_tasks.append(asyncio.create_task(healthcheck_loop(),    name="obs_healthcheck"))
+        _bg_tasks.append(asyncio.create_task(moblin_poller_loop(),  name="moblin_poller"))
+        _bg_tasks.append(asyncio.create_task(stream_watcher_loop(), name="stream_watcher"))
+        log.info("✅ Фоновые задачи запущены: healthcheck, poller, watcher")
 
     async def post_stop(application: Application) -> None:
-        nonlocal _hc_task
-        if _hc_task and not _hc_task.done():
-            _hc_task.cancel()
-            try: await _hc_task
-            except asyncio.CancelledError: pass
+        for t in _bg_tasks:
+            if not t.done():
+                t.cancel()
+                try: await t
+                except asyncio.CancelledError: pass
         log.info("Бот полностью остановлен")
 
     app.post_init = post_init
